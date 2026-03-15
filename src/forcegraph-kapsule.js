@@ -57,10 +57,25 @@ import accessorFn from 'accessor-fn';
 
 import { min as d3Min, max as d3Max } from 'd3-array';
 
+// Self-loop curve resolution (lower than the default 30 for regular curves — fewer vertices, cheaper TubeGeometry)
+const SELF_LOOP_CURVE_RESOLUTION = 12;
+
+// Reusable Vector3 pool for self-loop billboard calculations (avoids per-frame allocation)
+const _slCamDir = new three.Vector3();
+const _slAxis1 = new three.Vector3();
+const _slAxis2 = new three.Vector3();
+const _slCp1 = new three.Vector3();
+const _slCp2 = new three.Vector3();
+const _slStart = new three.Vector3();
+const _slLastCamDir = new three.Vector3(NaN, NaN, NaN); // sentinel: force first update
+
 import ThreeDigest from './utils/three-digest';
 import { emptyObject } from './utils/three-gc';
 import { autoColorObjects, colorStr2Hex, colorAlpha } from './utils/color-utils';
 import getDagDepths from './utils/dagDepths';
+import InstancedNodeRenderer from './utils/InstancedNodeRenderer';
+import InstancedLinkRenderer from './utils/InstancedLinkRenderer';
+import InstancedArrowRenderer from './utils/InstancedArrowRenderer';
 
 //
 
@@ -69,6 +84,97 @@ const DAG_LEVEL_NODE_RATIO = 2;
 // support multiple method names for backwards threejs compatibility
 const setAttributeFn = new three.BufferGeometry().setAttribute ? 'setAttribute' : 'addAttribute';
 const applyMatrix4Fn = new three.BufferGeometry().applyMatrix4 ? 'applyMatrix4' : 'applyMatrix';
+
+// Billboard self-loop update: recalculates self-loop curves to face the camera.
+// Called every frame from tickFrame (outside layoutTick) so loops stay camera-facing
+// even after simulation stops. Uses module-level Vector3 pool to avoid GC pressure.
+// Only iterates state._selfLoopLinks (populated by calcLinkCurve) — O(selfLoops), not O(allLinks).
+function updateSelfLoopBillboards(state, camera, isD3Sim) {
+  const selfLoops = state._selfLoopLinks;
+  if (!selfLoops || selfLoops.length === 0) return;
+
+  camera.getWorldDirection(_slCamDir);
+
+  // Skip entirely if camera direction hasn't changed — avoids expensive
+  // geometry rebuilds (TubeGeometry) and Vector3 allocations (getPoints) every idle frame.
+  if (_slCamDir.equals(_slLastCamDir)) return;
+
+  const linkWidthAccessor = accessorFn(state.linkWidth);
+
+  // Build camera-facing plane axes (perpendicular to camera look direction)
+  if (Math.abs(_slCamDir.y) < 0.9) {
+    _slAxis1.set(0, 1, 0).cross(_slCamDir).normalize();
+  } else {
+    _slAxis1.set(1, 0, 0).cross(_slCamDir).normalize();
+  }
+  _slAxis2.crossVectors(_slCamDir, _slAxis1).normalize();
+
+  let anySkipped = false;
+
+  for (let i = 0, len = selfLoops.length; i < len; i++) {
+    const link = selfLoops[i];
+
+    // Skip self-loops whose visual is hidden (e.g. hidden during camera movement)
+    const lineObj = state.linkDataMapper ? state.linkDataMapper.getObj(link) : null;
+    if (!lineObj || !lineObj.visible) { anySkipped = true; continue; }
+
+    const pos = isD3Sim ? link : state.layout.getLinkPosition(state.layout.graph.getLink(link.source, link.target).id);
+    const start = pos[isD3Sim ? 'source' : 'from'];
+    if (!start || !start.hasOwnProperty('x')) continue;
+
+    // Use pre-cached cos/sin (constant per link, computed once in calcLinkCurve)
+    _slStart.set(start.x, start.y || 0, start.z || 0);
+
+    const d = link.__selfLoopD;
+
+    // Compute control points in camera-facing plane
+    _slCp1.set(0, 0, 0)
+      .addScaledVector(_slAxis1, d * link.__selfLoopCosStart)
+      .addScaledVector(_slAxis2, d * link.__selfLoopSinStart)
+      .add(_slStart);
+
+    _slCp2.set(0, 0, 0)
+      .addScaledVector(_slAxis1, d * link.__selfLoopCosEnd)
+      .addScaledVector(_slAxis2, d * link.__selfLoopSinEnd)
+      .add(_slStart);
+
+    // Update the curve (reuse existing CubicBezierCurve3 — just move control points)
+    const curve = link.__curve;
+    if (curve) {
+      curve.v0.copy(_slStart);
+      curve.v1.copy(_slCp1);
+      curve.v2.copy(_slCp2);
+      curve.v3.copy(_slStart);
+    }
+
+    link.__cachedLength = null; // invalidate arrow length cache
+
+    const line = lineObj.children.length ? lineObj.children[0] : lineObj;
+
+    if (line.type === 'Line' && curve) {
+      const curvePnts = curve.getPoints(SELF_LOOP_CURVE_RESOLUTION);
+      if (line.geometry.getAttribute('position').array.length !== curvePnts.length * 3) {
+        line.geometry[setAttributeFn]('position', new three.BufferAttribute(new Float32Array(curvePnts.length * 3), 3));
+      }
+      line.geometry.setFromPoints(curvePnts);
+      line.geometry.computeBoundingSphere();
+    } else if (line.type === 'Mesh' && curve) {
+      const linkWidth = Math.ceil(linkWidthAccessor(link) * 10) / 10;
+      const r = linkWidth / 2;
+      const geometry = new three.TubeGeometry(curve, SELF_LOOP_CURVE_RESOLUTION, r, 3, false);
+      line.geometry.dispose();
+      line.geometry = geometry;
+    }
+  }
+
+  // Only cache direction if all self-loops were updated. If some were skipped
+  // (hidden), invalidate so the function re-runs when they become visible again.
+  if (anySkipped) {
+    _slLastCamDir.set(NaN, NaN, NaN);
+  } else {
+    _slLastCamDir.copy(_slCamDir);
+  }
+}
 
 export default Kapsule({
 
@@ -96,6 +202,8 @@ export default Kapsule({
       },
       onChange(graphData, state) {
         state.engineRunning = false; // Pause simulation immediately
+        state._selfLoopLinks = []; // Clear stale self-loop refs from previous data
+        _slLastCamDir.set(NaN, NaN, NaN); // Invalidate cache so billboard runs on first frame
       }
     },
     numDimensions: {
@@ -158,6 +266,7 @@ export default Kapsule({
     linkDirectionalParticleColor: {},
     linkDirectionalParticleResolution: { default: 4 }, // how many slice segments in the particle sphere's circumference
     linkDirectionalParticleThreeObject: {},
+    useInstancedRendering: { default: true }, // When false, all nodes/links go through ThreeDigest (individual meshes)
     forceEngine: { default: 'd3' }, // d3 or ngraph
     d3AlphaMin: { default: 0 },
     d3AlphaDecay: { default: 0.0228, triggerUpdate: false, onChange(alphaDecay, state) { state.d3ForceLayout.alphaDecay(alphaDecay) }},
@@ -175,6 +284,7 @@ export default Kapsule({
     warmupTicks: { default: 0, triggerUpdate: false }, // how many times to tick the force engine at init before starting to render
     cooldownTicks: { default: Infinity, triggerUpdate: false },
     cooldownTime: { default: 15000, triggerUpdate: false }, // ms
+    ticksPerFrame: { default: 10, triggerUpdate: false }, // how many simulation ticks to run per render frame (batch ticking)
     onLoading: { default: () => {}, triggerUpdate: false },
     onFinishLoading: { default: () => {}, triggerUpdate: false },
     onUpdate: { default: () => {}, triggerUpdate: false },
@@ -209,10 +319,29 @@ export default Kapsule({
       state.engineRunning = true;
       return this;
     },
-    tickFrame: function(state) {
+    tickFrame: function(state, camera) {
       const isD3Sim = state.forceEngine !== 'ngraph';
 
       if (state.engineRunning) { layoutTick(); }
+
+      // Instanced nodes: cheap updatePositions during simulation, sorted only when idle
+      if (state.useInstancedRendering && state.instancedNodeRenderer.count > 0) {
+        if (state.engineRunning) {
+          // Simulation running — positions changing every frame, sort is wasted CPU
+          state.instancedNodeRenderer.updatePositions(isD3Sim);
+        } else {
+          // Simulation stopped — sort by camera distance for correct transparency
+          state.instancedNodeRenderer.sortAndUpdatePositions(camera, isD3Sim);
+        }
+      }
+
+      // Billboard self-loops: recalculate curves to face camera when simulation is idle.
+      // During simulation, layoutTick already handles curve + geometry updates.
+      // This ensures loops stay camera-facing after simulation stops and user rotates.
+      if (!state.engineRunning && camera) {
+        updateSelfLoopBillboards(state, camera, isD3Sim);
+      }
+
       updateArrows();
       updatePhotons();
 
@@ -221,21 +350,35 @@ export default Kapsule({
       //
 
       function layoutTick() {
-        if (
-          ++state.cntTicks > state.cooldownTicks ||
-          (new Date()) - state.startTickTime > state.cooldownTime ||
-          (isD3Sim && state.d3AlphaMin > 0 && state.d3ForceLayout.alpha() < state.d3AlphaMin)
-        ) {
+        // Batch ticking: run multiple simulation ticks per render frame
+        const batchSize = Math.max(1, state.ticksPerFrame || 1);
+        let stopped = false;
+
+        for (let t = 0; t < batchSize; t++) {
+          if (
+            ++state.cntTicks > state.cooldownTicks ||
+            (new Date()) - state.startTickTime > state.cooldownTime ||
+            (isD3Sim && state.d3AlphaMin > 0 && state.d3ForceLayout.alpha() < state.d3AlphaMin)
+          ) {
+            stopped = true;
+            break;
+          }
+          state.layout[isD3Sim ? 'tick' : 'step'](); // Tick it
+        }
+
+        if (stopped) {
           state.engineRunning = false; // Stop ticking graph
+          // Trigger one sort pass now that positions are final
+          if (state.useInstancedRendering) {
+            state.instancedNodeRenderer._positionsDirty = true;
+          }
           state.onEngineStop();
         } else {
-          state.layout[isD3Sim ? 'tick' : 'step'](); // Tick it
           state.onEngineTick();
         }
 
+        // Update custom node positions (ThreeDigest path — cluster nodes etc.)
         const nodeThreeObjectExtendAccessor = accessorFn(state.nodeThreeObjectExtend);
-
-        // Update nodes position
         state.nodeDataMapper.entries().forEach(([node, obj]) => {
           if (!obj) return;
 
@@ -243,7 +386,7 @@ export default Kapsule({
 
           const extendedObj = nodeThreeObjectExtendAccessor(node);
           if (!state.nodePositionUpdate
-            || !state.nodePositionUpdate(extendedObj ? obj.children[0] : obj, { x: pos.x, y: pos.y, z: pos.z }, node) // pass child custom object if extending the default
+            || !state.nodePositionUpdate(extendedObj ? obj.children[0] : obj, { x: pos.x, y: pos.y, z: pos.z }, node)
             || extendedObj) {
             obj.position.x = pos.x;
             obj.position.y = pos.y || 0;
@@ -251,13 +394,23 @@ export default Kapsule({
           }
         });
 
-        // Update links position
+        // Update instanced link positions
         const linkWidthAccessor = accessorFn(state.linkWidth);
+        if (state.useInstancedRendering) {
+          state.instancedLinkRenderer.updatePositions(isD3Sim, linkWidthAccessor(state.graphData.links[0] || {}));
+        }
+
+        // Update custom/curved link positions (ThreeDigest path)
         const linkCurvatureAccessor = accessorFn(state.linkCurvature);
         const linkCurveRotationAccessor = accessorFn(state.linkCurveRotation);
         const linkThreeObjectExtendAccessor = accessorFn(state.linkThreeObjectExtend);
+        // Rebuild self-loop index for per-frame billboard update
+        state._selfLoopLinks = [];
         state.linkDataMapper.entries().forEach(([link, lineObj]) => {
           if (!lineObj) return;
+
+          // Skip hidden links entirely (e.g. self-edges hidden during camera movement)
+          if (!lineObj.visible) return;
 
           const pos = isD3Sim
             ? link
@@ -268,6 +421,7 @@ export default Kapsule({
           if (!start || !end || !start.hasOwnProperty('x') || !end.hasOwnProperty('x')) return; // skip invalid link
 
           calcLinkCurve(link); // calculate link curve for all links, including custom replaced, so it can be used in directional functionality
+          link.__cachedLength = null; // invalidate arrow length cache
 
           const extendedObj = linkThreeObjectExtendAccessor(link);
           if (state.linkPositionUpdate && state.linkPositionUpdate(
@@ -279,7 +433,8 @@ export default Kapsule({
             return;
           }
 
-          const curveResolution = 30; // # line segments
+          const isSelfLoop = link.__isSelfLoop;
+          const curveResolution = isSelfLoop ? SELF_LOOP_CURVE_RESOLUTION : 30;
           const curve = link.__curve;
 
           // select default line obj if it's an extended group
@@ -348,8 +503,9 @@ export default Kapsule({
 
               const linkWidth = Math.ceil(linkWidthAccessor(link) * 10) / 10;
               const r = linkWidth / 2;
+              const tubeRadialSegments = isSelfLoop ? 3 : state.linkResolution;
 
-              const geometry = new three.TubeGeometry(curve, curveResolution, r, state.linkResolution, false);
+              const geometry = new three.TubeGeometry(curve, curveResolution, r, tubeRadialSegments, false);
 
               line.geometry.dispose();
               line.geometry = geometry;
@@ -372,6 +528,7 @@ export default Kapsule({
 
           if (!curvature) {
             link.__curve = null; // Straight line
+            link.__isSelfLoop = false;
 
           } else { // bezier curve line (only for line types)
             const vStart = new three.Vector3(start.x, start.y || 0, start.z || 0);
@@ -383,6 +540,7 @@ export default Kapsule({
             const curveRotation = linkCurveRotationAccessor(link);
 
             if (l > 0) {
+              link.__isSelfLoop = false;
               const dx = end.x - start.x;
               const dy = end.y - start.y || 0;
 
@@ -396,17 +554,28 @@ export default Kapsule({
                 .add((new three.Vector3()).addVectors(vStart, vEnd).divideScalar(2));
 
               curve = new three.QuadraticBezierCurve3(vStart, cp, vEnd);
-            } else { // Same point, draw a loop
-              const d = curvature * 70;
-              const endAngle = -curveRotation; // Rotate clockwise (from Z angle perspective)
-              const startAngle = endAngle + Math.PI / 2;
+            } else { // Same point — self-loop. Mark for billboard update every frame.
+              // Compute node radius so the loop scales with node size
+              const nodeValAccessor = accessorFn(state.nodeVal);
+              const nodeR = Math.cbrt(Math.max(0, nodeValAccessor(start) || 1)) * state.nodeRelSize;
+              const d = curvature * 70 + nodeR;
 
-              curve = new three.CubicBezierCurve3(
-                vStart,
-                new three.Vector3(d * Math.cos(startAngle), d * Math.sin(startAngle), 0).add(vStart),
-                new three.Vector3(d * Math.cos(endAngle), d * Math.sin(endAngle), 0).add(vStart),
-                vEnd
-              );
+              // Store params for per-frame billboard recalc in updateSelfLoopBillboards()
+              link.__isSelfLoop = true;
+              state._selfLoopLinks.push(link);
+              link.__selfLoopD = d;
+              const sa = -curveRotation + Math.PI / 2;
+              const ea = -curveRotation;
+              // Pre-cache trig (constant per link — avoids recomputing every frame)
+              link.__selfLoopCosStart = Math.cos(sa);
+              link.__selfLoopSinStart = Math.sin(sa);
+              link.__selfLoopCosEnd = Math.cos(ea);
+              link.__selfLoopSinEnd = Math.sin(ea);
+
+              // Initial curve (XY plane fallback — will be overwritten by billboard update)
+              const cp1 = new three.Vector3(d * link.__selfLoopCosStart, d * link.__selfLoopSinStart, 0).add(vStart);
+              const cp2 = new three.Vector3(d * link.__selfLoopCosEnd, d * link.__selfLoopSinEnd, 0).add(vStart);
+              curve = new three.CubicBezierCurve3(vStart, cp1, cp2, vEnd);
             }
 
             link.__curve = curve;
@@ -415,13 +584,31 @@ export default Kapsule({
       }
 
       function updateArrows() {
-        // update link arrow position
+        // update instanced arrows
         const arrowRelPosAccessor = accessorFn(state.linkDirectionalArrowRelPos);
         const arrowLengthAccessor = accessorFn(state.linkDirectionalArrowLength);
         const nodeValAccessor = accessorFn(state.nodeVal);
 
+        if (state.instancedArrowRenderer._created && state.instancedArrowRenderer.count > 0) {
+          state.instancedArrowRenderer.updatePositions(isD3Sim, {
+            arrowLength: arrowLengthAccessor,
+            arrowRelPos: arrowRelPosAccessor,
+            nodeVal: nodeValAccessor,
+            nodeRelSize: state.nodeRelSize,
+          });
+        }
+
+        // update custom arrows (ThreeDigest path)
         state.arrowDataMapper.entries().forEach(([link, arrowObj]) => {
           if (!arrowObj) return;
+
+          // Skip arrows for hidden links (e.g. self-edges hidden during camera movement)
+          const lineObj = link.__lineObj;
+          if (lineObj && !lineObj.visible) {
+            arrowObj.visible = false;
+            return;
+          }
+          arrowObj.visible = true;
 
           const pos = isD3Sim
             ? link
@@ -449,8 +636,9 @@ export default Kapsule({
             }
           };
 
+          // Use cached length when available (invalidated in layoutTick/billboard update)
           const lineLen = link.__curve
-            ? link.__curve.getLength()
+            ? (link.__cachedLength ?? (link.__cachedLength = link.__curve.getLength()))
             : Math.sqrt(['x', 'y', 'z'].map(dim => Math.pow((end[dim] || 0) - (start[dim] || 0), 2)).reduce((acc, v) => acc + v, 0));
 
           const posAlongLine = startR + arrowLength + (lineLen - startR - endR - arrowLength) * arrowRelPos;
@@ -579,21 +767,29 @@ export default Kapsule({
     getGraphBbox: function(state, nodeFilter = () => true) {
       if (!state.initialised) return null;
 
-      // recursively collect all nested geometries bboxes
-      const bboxes = (function getBboxes(obj) {
-        const bboxes = [];
+      // Collect bboxes from instanced renderers
+      const bboxes = [];
+      const instancedNodeBbox = state.instancedNodeRenderer.computeBBox(nodeFilter);
+      if (instancedNodeBbox) bboxes.push(instancedNodeBbox);
+      const instancedLinkBbox = state.instancedLinkRenderer.computeBBox();
+      if (instancedLinkBbox) bboxes.push(instancedLinkBbox);
 
-        if (obj.geometry) {
+      // Also collect from ThreeDigest objects (custom nodes/links)
+      ;(function getBboxes(obj) {
+        // Skip instanced renderer meshes (already handled above)
+        if (obj.__isInstancedRenderer) return;
+
+        if (obj.geometry && !obj.isInstancedMesh) {
           obj.geometry.computeBoundingBox();
           const box = new three.Box3();
           box.copy(obj.geometry.boundingBox).applyMatrix4(obj.matrixWorld);
           bboxes.push(box);
         }
-        return bboxes.concat(...(obj.children || [])
+        (obj.children || [])
           .filter(obj => !obj.hasOwnProperty('__graphObjType') ||
-            (obj.__graphObjType === 'node' && nodeFilter(obj.__data)) // exclude filtered out nodes
+            (obj.__graphObjType === 'node' && nodeFilter(obj.__data))
           )
-          .map(getBboxes));
+          .forEach(getBboxes);
       })(state.graphScene);
 
       if (!bboxes.length) return null;
@@ -622,6 +818,13 @@ export default Kapsule({
     // Main three object to manipulate
     state.graphScene = threeObj;
 
+    // Instanced renderers for default nodes/links/arrows (single draw call each)
+    state.instancedNodeRenderer = new InstancedNodeRenderer(threeObj);
+    state.instancedNodeRenderer.init(state.nodeResolution);
+    state.instancedLinkRenderer = new InstancedLinkRenderer(threeObj);
+    state.instancedArrowRenderer = new InstancedArrowRenderer(threeObj);
+
+    // ThreeDigest kept only for custom objects (nodeThreeObject, curved links, etc.)
     state.nodeDataMapper = new ThreeDigest(threeObj, { objBindAttr: '__threeObj' });
     state.linkDataMapper = new ThreeDigest(threeObj, { objBindAttr: '__lineObj' });
     state.arrowDataMapper = new ThreeDigest(threeObj, { objBindAttr: '__arrowObj' });
@@ -629,6 +832,7 @@ export default Kapsule({
   },
 
   update(state, changedProps) {
+    const _t0 = performance.now();
     const hasAnyPropChanged = propList => propList.some(p => changedProps.hasOwnProperty(p));
 
     state.engineRunning = false; // pause simulation
@@ -653,7 +857,8 @@ export default Kapsule({
       'nodeVisibility',
       'nodeRelSize',
       'nodeResolution',
-      'nodeOpacity'
+      'nodeOpacity',
+      'useInstancedRendering'
     ])) {
       const customObjectAccessor = accessorFn(state.nodeThreeObject);
       const customObjectExtendAccessor = accessorFn(state.nodeThreeObjectExtend);
@@ -661,11 +866,49 @@ export default Kapsule({
       const colorAccessor = accessorFn(state.nodeColor);
       const visibilityAccessor = accessorFn(state.nodeVisibility);
 
+      const visibleNodes = state.graphData.nodes.filter(visibilityAccessor);
+
+      // Partition nodes: custom (nodeThreeObject returns truthy) vs default (instanced)
+      const customNodes = [];
+      const defaultNodes = [];
+      if (state.useInstancedRendering) {
+        visibleNodes.forEach(node => {
+          if (customObjectAccessor(node)) {
+            customNodes.push(node);
+          } else {
+            defaultNodes.push(node);
+          }
+        });
+      } else {
+        // All nodes go through ThreeDigest when instanced rendering is disabled
+        customNodes.push(...visibleNodes);
+      }
+
+      // === Instanced path for default nodes (single draw call) ===
+      if (state.useInstancedRendering) {
+        // Re-init if resolution changed
+        if (state.instancedNodeRenderer._resolution !== state.nodeResolution) {
+          state.instancedNodeRenderer.init(state.nodeResolution);
+        }
+        state.instancedNodeRenderer.digest(defaultNodes, {
+          val: valAccessor,
+          color: colorAccessor,
+          opacity: state.nodeOpacity,
+          relSize: state.nodeRelSize,
+        });
+      } else {
+        // Clear instanced renderer
+        if (state.instancedNodeRenderer._created) {
+          state.instancedNodeRenderer.mesh.count = 0;
+          state.instancedNodeRenderer.count = 0;
+        }
+      }
+
+      // === ThreeDigest path for custom nodes only (cluster shapes, etc.) ===
       const sphereGeometries = {}; // indexed by node value
       const sphereMaterials = {}; // indexed by color
 
       if (state._flushObjects || hasAnyPropChanged([
-        // recreate objects if any of these props have changed
         'nodeThreeObject',
         'nodeThreeObjectExtend'
       ])) state.nodeDataMapper.clear();
@@ -676,7 +919,6 @@ export default Kapsule({
           const extendObj = customObjectExtendAccessor(node);
 
           if (customObj && state.nodeThreeObject === customObj) {
-            // clone object if it's a shared object among all nodes
             customObj = customObj.clone();
           }
 
@@ -684,21 +926,21 @@ export default Kapsule({
 
           if (customObj && !extendObj) {
             obj = customObj;
-          } else { // Add default object (sphere mesh)
+          } else {
             obj = new three.Mesh();
             obj.__graphDefaultObj = true;
 
             if (customObj && extendObj) {
-              obj.add(customObj); // extend default with custom
+              obj.add(customObj);
             }
           }
 
-          obj.__graphObjType = 'node'; // Add object type
+          obj.__graphObjType = 'node';
 
           return obj;
         })
         .onUpdateObj((obj, node) => {
-          if (obj.__graphDefaultObj) { // bypass internal updates for custom node objects
+          if (obj.__graphDefaultObj) {
             const val = valAccessor(node) || 1;
             const radius = Math.cbrt(val) * state.nodeRelSize;
             const numSegments = state.nodeResolution;
@@ -736,7 +978,7 @@ export default Kapsule({
             }
           }
         })
-        .digest(state.graphData.nodes.filter(visibilityAccessor));
+        .digest(customNodes);
     }
 
     // Digest links WebGL objects
@@ -757,7 +999,8 @@ export default Kapsule({
       'linkDirectionalParticleWidth',
       'linkDirectionalParticleColor',
       'linkDirectionalParticleResolution',
-      'linkDirectionalParticleThreeObject'
+      'linkDirectionalParticleThreeObject',
+      'useInstancedRendering'
     ])) {
       const customObjectAccessor = accessorFn(state.linkThreeObject);
       const customObjectExtendAccessor = accessorFn(state.linkThreeObjectExtend);
@@ -765,16 +1008,122 @@ export default Kapsule({
       const visibilityAccessor = accessorFn(state.linkVisibility);
       const colorAccessor = accessorFn(state.linkColor);
       const widthAccessor = accessorFn(state.linkWidth);
-
-      const cylinderGeometries = {}; // indexed by link width
-      const lambertLineMaterials = {}; // for cylinder objects, indexed by link color
-      const basicLineMaterials = {}; // for line objects, indexed by link color
+      const linkCurvatureAccessor = accessorFn(state.linkCurvature);
 
       const visibleLinks = state.graphData.links.filter(visibilityAccessor);
 
-      // lines digest cycle
+      // Partition links: custom/curved → ThreeDigest, default/straight → instanced
+      const customLinks = [];
+      const defaultLinks = [];
+      if (state.useInstancedRendering) {
+        visibleLinks.forEach(link => {
+          if (customObjectAccessor(link) || linkCurvatureAccessor(link)) {
+            customLinks.push(link);
+          } else {
+            defaultLinks.push(link);
+          }
+        });
+      } else {
+        // All links go through ThreeDigest when instanced rendering is disabled
+        customLinks.push(...visibleLinks);
+      }
+
+      // === Instanced path for default straight links (single draw call) ===
+      if (state.useInstancedRendering) {
+        const useCylinder = !!widthAccessor(defaultLinks[0] || {});
+        // Initialize or re-init if mode changed
+        if (!state.instancedLinkRenderer._created
+          || (useCylinder && state.instancedLinkRenderer._mode !== 'cylinder')
+          || (!useCylinder && state.instancedLinkRenderer._mode !== 'line')
+        ) {
+          state.instancedLinkRenderer.init(useCylinder, state.linkResolution);
+        }
+
+        state.instancedLinkRenderer.digest(defaultLinks, {
+          color: colorAccessor,
+          opacity: state.linkOpacity,
+          width: widthAccessor,
+        });
+      } else {
+        // Clear instanced link renderer
+        if (state.instancedLinkRenderer._created) {
+          if (state.instancedLinkRenderer._mode === 'line' && state.instancedLinkRenderer.lineSegments) {
+            state.instancedLinkRenderer.lineSegments.geometry.setDrawRange(0, 0);
+          } else if (state.instancedLinkRenderer.cylinderMesh) {
+            state.instancedLinkRenderer.cylinderMesh.count = 0;
+          }
+          state.instancedLinkRenderer.count = 0;
+        }
+      }
+
+      // === Instanced arrows ===
+      if (state.linkDirectionalArrowLength || changedProps.hasOwnProperty('linkDirectionalArrowLength')) {
+        const arrowLengthAccessor = accessorFn(state.linkDirectionalArrowLength);
+        const arrowColorAccessor = accessorFn(state.linkDirectionalArrowColor);
+
+        if (state.useInstancedRendering) {
+          if (!state.instancedArrowRenderer._created || state.instancedArrowRenderer._resolution !== state.linkDirectionalArrowResolution) {
+            state.instancedArrowRenderer.init(state.linkDirectionalArrowResolution);
+          }
+
+          // Arrows on instanced links
+          const instancedArrowLinks = defaultLinks.filter(arrowLengthAccessor);
+          state.instancedArrowRenderer.digest(instancedArrowLinks, {
+            arrowLength: arrowLengthAccessor,
+            arrowColor: arrowColorAccessor,
+            linkColor: colorAccessor,
+            linkOpacity: state.linkOpacity,
+          });
+        } else {
+          // Clear instanced arrow renderer
+          if (state.instancedArrowRenderer._created) {
+            state.instancedArrowRenderer.mesh.count = 0;
+          }
+        }
+
+        // Arrows on custom links (ThreeDigest path) — all links when instanced is off
+        const arrowSourceLinks = state.useInstancedRendering ? customLinks : visibleLinks;
+        const customArrowLinks = arrowSourceLinks.filter(arrowLengthAccessor);
+        state.arrowDataMapper
+          .onCreateObj(() => {
+            const obj = new three.Mesh(undefined, new three.MeshLambertMaterial({ transparent: true }));
+            obj.__linkThreeObjType = 'arrow';
+            return obj;
+          })
+          .onUpdateObj((obj, link) => {
+            const arrowLength = arrowLengthAccessor(link);
+            const numSegments = state.linkDirectionalArrowResolution;
+
+            if (!obj.geometry.type.match(/^Cone(Buffer)?Geometry$/)
+              || obj.geometry.parameters.height !== arrowLength
+              || obj.geometry.parameters.radialSegments !== numSegments
+            ) {
+              const coneGeometry = new three.ConeGeometry(arrowLength * 0.25, arrowLength, numSegments);
+              coneGeometry.translate(0, arrowLength / 2, 0);
+              coneGeometry.rotateX(Math.PI / 2);
+              obj.geometry.dispose();
+              obj.geometry = coneGeometry;
+            }
+
+            const arrowColor = arrowColorAccessor(link) || colorAccessor(link) || '#f0f0f0';
+            obj.material.color = new three.Color(colorStr2Hex(arrowColor));
+            obj.material.opacity = state.linkOpacity * 3 * colorAlpha(arrowColor);
+          })
+          .digest(customArrowLinks);
+      } else {
+        // No arrows — clear instanced arrow renderer
+        if (state.instancedArrowRenderer._created) {
+          state.instancedArrowRenderer.mesh.count = 0;
+        }
+        state.arrowDataMapper.digest([]);
+      }
+
+      // === ThreeDigest path for custom/curved links ===
+      const cylinderGeometries = {};
+      const lambertLineMaterials = {};
+      const basicLineMaterials = {};
+
       if (state._flushObjects || hasAnyPropChanged([
-        // recreate objects if any of these props have changed
         'linkThreeObject',
         'linkThreeObjectExtend',
         'linkWidth'
@@ -782,7 +1131,6 @@ export default Kapsule({
 
       state.linkDataMapper
         .onRemoveObj(obj => {
-          // remove trailing single photons
           const singlePhotonsObj = obj.__data && obj.__data.__singleHopPhotonsObj;
           if (singlePhotonsObj) {
             singlePhotonsObj.parent.remove(singlePhotonsObj);
@@ -795,21 +1143,17 @@ export default Kapsule({
           const extendObj = customObjectExtendAccessor(link);
 
           if (customObj && state.linkThreeObject === customObj) {
-            // clone object if it's a shared object among all links
             customObj = customObj.clone();
           }
 
           let defaultObj;
           if (!customObj || extendObj) {
-            // construct default line obj
             const useCylinder = !!widthAccessor(link);
-
             if (useCylinder) {
               defaultObj = new three.Mesh();
-            } else { // Use plain line (constant width)
+            } else {
               const lineGeometry = new three.BufferGeometry();
               lineGeometry[setAttributeFn]('position', new three.BufferAttribute(new Float32Array(2 * 3), 3));
-
               defaultObj = new three.Line(lineGeometry);
             }
           }
@@ -820,31 +1164,23 @@ export default Kapsule({
             obj.__graphDefaultObj = true;
           } else {
             if (!extendObj) {
-              // use custom object
               obj = customObj;
             } else {
-              // extend default with custom in a group
               obj = new three.Group();
               obj.__graphDefaultObj = true;
-
               obj.add(defaultObj);
               obj.add(customObj);
             }
           }
 
-          obj.renderOrder = 10; // Prevent visual glitches of dark lines on top of nodes by rendering them last
-
-          obj.__graphObjType = 'link'; // Add object type
-
+          obj.renderOrder = 10;
+          obj.__graphObjType = 'link';
           return obj;
         })
         .onUpdateObj((updObj, link) => {
-          if (updObj.__graphDefaultObj) { // bypass internal updates for custom link objects
-            // select default object if it's an extended group
+          if (updObj.__graphDefaultObj) {
             const obj = updObj.children.length ? updObj.children[0] : updObj;
-
             const linkWidth = Math.ceil(widthAccessor(link) * 10) / 10;
-
             const useCylinder = !!linkWidth;
 
             if (useCylinder) {
@@ -861,7 +1197,6 @@ export default Kapsule({
                   geometry[applyMatrix4Fn](new three.Matrix4().makeRotationX(Math.PI / 2));
                   cylinderGeometries[linkWidth] = geometry;
                 }
-
                 obj.geometry.dispose();
                 obj.geometry = cylinderGeometries[linkWidth];
               }
@@ -886,53 +1221,16 @@ export default Kapsule({
                     color: materialColor,
                     transparent: opacity < 1,
                     opacity,
-                    depthWrite: opacity >= 1 // Prevent transparency issues
+                    depthWrite: opacity >= 1
                   });
                 }
-
                 obj.material.dispose();
                 obj.material = lineMaterials[color];
               }
             }
           }
         })
-        .digest(visibleLinks)
-
-      // Arrows digest cycle
-      if (state.linkDirectionalArrowLength || changedProps.hasOwnProperty('linkDirectionalArrowLength')) {
-        const arrowLengthAccessor = accessorFn(state.linkDirectionalArrowLength);
-        const arrowColorAccessor = accessorFn(state.linkDirectionalArrowColor);
-
-        state.arrowDataMapper
-          .onCreateObj(() => {
-            const obj = new three.Mesh(undefined, new three.MeshLambertMaterial({ transparent: true }));
-            obj.__linkThreeObjType = 'arrow'; // Add object type
-
-            return obj;
-          })
-          .onUpdateObj((obj, link) => {
-            const arrowLength = arrowLengthAccessor(link);
-            const numSegments = state.linkDirectionalArrowResolution;
-
-            if (!obj.geometry.type.match(/^Cone(Buffer)?Geometry$/)
-              || obj.geometry.parameters.height !== arrowLength
-              || obj.geometry.parameters.radialSegments !== numSegments
-            ) {
-              const coneGeometry = new three.ConeGeometry(arrowLength * 0.25, arrowLength, numSegments);
-              // Correct orientation
-              coneGeometry.translate(0, arrowLength / 2, 0);
-              coneGeometry.rotateX(Math.PI / 2);
-
-              obj.geometry.dispose();
-              obj.geometry = coneGeometry;
-            }
-
-            const arrowColor = arrowColorAccessor(link) || colorAccessor(link) || '#f0f0f0';
-            obj.material.color = new three.Color(colorStr2Hex(arrowColor));
-            obj.material.opacity = state.linkOpacity * 3 * colorAlpha(arrowColor);
-          })
-          .digest(visibleLinks.filter(arrowLengthAccessor));
-      }
+        .digest(customLinks)
 
       // Photon particles digest cycle
       if (state.linkDirectionalParticles || changedProps.hasOwnProperty('linkDirectionalParticles')) {
@@ -1122,6 +1420,14 @@ export default Kapsule({
 
     state.engineRunning = true; // resume simulation
 
+    if (typeof window !== 'undefined' && window.__PERF_METRICS__) {
+      window.__PERF_METRICS__.entries.push({
+        label: 'forcegraphUpdate',
+        ms: performance.now() - _t0,
+        ts: Date.now(),
+        extra: { changedPropsCount: Object.keys(changedProps).length },
+      });
+    }
     state.onFinishUpdate();
   }
 });
