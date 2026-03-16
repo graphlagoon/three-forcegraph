@@ -394,15 +394,25 @@ export default Kapsule({
           }
         });
 
-        // Update instanced link positions
+        // Link accessors (needed by both instanced and ThreeDigest paths)
         const linkWidthAccessor = accessorFn(state.linkWidth);
+        const linkCurvatureAccessor = accessorFn(state.linkCurvature);
+        const linkCurveRotationAccessor = accessorFn(state.linkCurveRotation);
+
+        // Compute curves for instanced links before position update
         if (state.useInstancedRendering) {
-          state.instancedLinkRenderer.updatePositions(isD3Sim, linkWidthAccessor(state.graphData.links[0] || {}));
+          const ilr = state.instancedLinkRenderer;
+          for (let i = 0; i < ilr.count; i++) {
+            const link = ilr.linkDataArray[i];
+            if (link) {
+              calcLinkCurve(link);
+              link.__cachedLength = null;
+            }
+          }
+          ilr.updatePositions(isD3Sim, linkWidthAccessor(state.graphData.links[0] || {}));
         }
 
         // Update custom/curved link positions (ThreeDigest path)
-        const linkCurvatureAccessor = accessorFn(state.linkCurvature);
-        const linkCurveRotationAccessor = accessorFn(state.linkCurveRotation);
         const linkThreeObjectExtendAccessor = accessorFn(state.linkThreeObjectExtend);
         // Rebuild self-loop index for per-frame billboard update
         state._selfLoopLinks = [];
@@ -821,7 +831,7 @@ export default Kapsule({
     // Instanced renderers for default nodes/links/arrows (single draw call each)
     state.instancedNodeRenderer = new InstancedNodeRenderer(threeObj);
     state.instancedNodeRenderer.init(state.nodeResolution);
-    state.instancedLinkRenderer = new InstancedLinkRenderer(threeObj);
+    state.instancedLinkRenderer = new InstancedLinkRenderer(threeObj, 20000, 12);
     state.instancedArrowRenderer = new InstancedArrowRenderer(threeObj);
 
     // ThreeDigest kept only for custom objects (nodeThreeObject, curved links, etc.)
@@ -1012,12 +1022,16 @@ export default Kapsule({
 
       const visibleLinks = state.graphData.links.filter(visibilityAccessor);
 
-      // Partition links: custom/curved → ThreeDigest, default/straight → instanced
+      // Partition links: custom objects + self-loops → ThreeDigest, all others → instanced
+      // Curved non-self-loop links stay in instanced path (tessellated into multi-segment lines/cylinders)
       const customLinks = [];
       const defaultLinks = [];
       if (state.useInstancedRendering) {
         visibleLinks.forEach(link => {
-          if (customObjectAccessor(link) || linkCurvatureAccessor(link)) {
+          const srcId = typeof link.source === 'object' ? link.source[state.nodeId] : link.source;
+          const tgtId = typeof link.target === 'object' ? link.target[state.nodeId] : link.target;
+          const isSelfLoop = srcId !== undefined && srcId === tgtId;
+          if (customObjectAccessor(link) || (isSelfLoop && linkCurvatureAccessor(link))) {
             customLinks.push(link);
           } else {
             defaultLinks.push(link);
