@@ -890,8 +890,10 @@ export default Kapsule({
           }
         });
       } else {
-        // All nodes go through ThreeDigest when instanced rendering is disabled
-        customNodes.push(...visibleNodes);
+        // All nodes go through ThreeDigest when instanced rendering is disabled.
+        // Loop instead of push(...visibleNodes): spreading a large array into a call
+        // overflows V8's argument limit (~130k) → "Maximum call stack size exceeded".
+        for (let i = 0; i < visibleNodes.length; i++) customNodes.push(visibleNodes[i]);
       }
 
       // === Instanced path for default nodes (single draw call) ===
@@ -1038,8 +1040,10 @@ export default Kapsule({
           }
         });
       } else {
-        // All links go through ThreeDigest when instanced rendering is disabled
-        customLinks.push(...visibleLinks);
+        // All links go through ThreeDigest when instanced rendering is disabled.
+        // Loop instead of push(...visibleLinks): spreading a large array into a call
+        // overflows V8's argument limit (~130k) → "Maximum call stack size exceeded".
+        for (let i = 0; i < visibleLinks.length; i++) customLinks.push(visibleLinks[i]);
       }
 
       // === Instanced path for default straight links (single draw call) ===
@@ -1380,7 +1384,13 @@ export default Kapsule({
             onLoopError: state.onDagError || undefined
           }
         );
-        const maxDepth = Math.max(...Object.values(nodeDepths || []));
+        // Loop instead of Math.max(...values): spreading a large array into a call
+        // overflows V8's argument limit (~130k) → "Maximum call stack size exceeded".
+        const depthValues = Object.values(nodeDepths || []);
+        let maxDepth = 0;
+        for (let i = 0; i < depthValues.length; i++) {
+          if (i === 0 || depthValues[i] > maxDepth) maxDepth = depthValues[i];
+        }
         const dagLevelDistance = state.dagLevelDistance || (
           state.graphData.nodes.length / (maxDepth || 1) * DAG_LEVEL_NODE_RATIO
           * (['radialin', 'radialout'].indexOf(state.dagMode) !== -1 ? 0.7 : 1)
