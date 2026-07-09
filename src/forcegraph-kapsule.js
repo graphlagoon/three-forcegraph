@@ -993,6 +993,7 @@ export default Kapsule({
         .digest(customNodes);
     }
 
+    const _tLinks = performance.now();
     // Digest links WebGL objects
     if (state._flushObjects || hasAnyPropChanged([
       'graphData',
@@ -1337,6 +1338,7 @@ export default Kapsule({
     state._flushObjects = false; // reset objects refresh flag
 
     // simulation engine
+    const _tForce = performance.now();
     if (hasAnyPropChanged([
       'graphData',
       'nodeId',
@@ -1445,11 +1447,19 @@ export default Kapsule({
     state.engineRunning = true; // resume simulation
 
     if (typeof window !== 'undefined' && window.__PERF_METRICS__) {
+      const _tEnd = performance.now();
       window.__PERF_METRICS__.entries.push({
         label: 'forcegraphUpdate',
-        ms: performance.now() - _t0,
+        ms: _tEnd - _t0,
         ts: Date.now(),
-        extra: { changedPropsCount: Object.keys(changedProps).length },
+        extra: {
+          changedPropsCount: Object.keys(changedProps).length,
+          nodesMs: Math.round(_tLinks - _t0),
+          linksMs: Math.round(_tForce - _tLinks),
+          forceMs: Math.round(_tEnd - _tForce),
+          nodeCount: state.graphData.nodes.length,
+          linkCount: state.graphData.links.length,
+        },
       });
     }
     state.onFinishUpdate();
