@@ -41,8 +41,11 @@ export default class InstancedNodeRenderer {
     this.colorArray = new Float32Array(maxNodes * 3);
     this.opacityArray = new Float32Array(maxNodes);
 
-    // Sort indirection: _sortIndices[sortedPos] = origIdx
-    this._sortIndices = new Uint16Array(maxNodes);
+    // Sort indirection: _sortIndices[sortedPos] = origIdx.
+    // Uint32: values are node indices up to maxNodes (100k default) — Uint16
+    // wrapped past 65535, duplicating indices, which drew some nodes twice,
+    // dropped others, and made instanceId picking resolve to the wrong node.
+    this._sortIndices = new Uint32Array(maxNodes);
     this._distances = new Float32Array(maxNodes);
 
     // Camera cache — skip sort when camera hasn't moved
